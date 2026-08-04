@@ -1,0 +1,42 @@
+aarch64: detect native CPU from /proc/cpuinfo instead of system registers
+
+Reading the ID_AA64* system registers (e.g. midr_el1) from EL0 requires the
+kernel to trap or emulate those accesses. Linux only started emulating them
+in 4.11, so on older kernels (e.g. the 4.9 kernel of some Android devices)
+any zig invocation that performs native CPU detection dies with SIGILL.
+
+Use the already-existing /proc/cpuinfo parser (which supports the aarch64
+cpuinfo format and is unit-tested) for aarch64 instead.
+
+diff --git a/zig/lib/std/zig/system/linux.zig b/zig/lib/std/zig/system/linux.zig
+--- a/zig/lib/std/zig/system/linux.zig
++++ b/zig/lib/std/zig/system/linux.zig
+@@ -458,23 +458,10 @@
+             return ArmCpuinfoParser.parse(current_arch, &file_reader.interface) catch null;
+         },
+         .aarch64, .aarch64_be => {
+-            const registers = [12]u64{
+-                getAArch64CpuFeature("MIDR_EL1"),
+-                getAArch64CpuFeature("ID_AA64PFR0_EL1"),
+-                getAArch64CpuFeature("ID_AA64PFR1_EL1"),
+-                getAArch64CpuFeature("ID_AA64DFR0_EL1"),
+-                getAArch64CpuFeature("ID_AA64DFR1_EL1"),
+-                getAArch64CpuFeature("ID_AA64AFR0_EL1"),
+-                getAArch64CpuFeature("ID_AA64AFR1_EL1"),
+-                getAArch64CpuFeature("ID_AA64ISAR0_EL1"),
+-                getAArch64CpuFeature("ID_AA64ISAR1_EL1"),
+-                getAArch64CpuFeature("ID_AA64MMFR0_EL1"),
+-                getAArch64CpuFeature("ID_AA64MMFR1_EL1"),
+-                getAArch64CpuFeature("ID_AA64MMFR2_EL1"),
+-            };
+-
+-            const core = @import("arm.zig").aarch64.detectNativeCpuAndFeatures(current_arch, registers);
+-            return core;
++            // Reading these system registers from EL0 requires kernel
++            // emulation that only exists on Linux >= 4.11; older kernels
++            // raise SIGILL here. /proc/cpuinfo works everywhere.
++            return ArmCpuinfoParser.parse(current_arch, &file_reader.interface) catch null;
+         },
+         .sparc, .sparc64 => {
+             return SparcCpuinfoParser.parse(current_arch, &file_reader.interface) catch null;
+         },

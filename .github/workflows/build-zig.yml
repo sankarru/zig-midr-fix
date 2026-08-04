@@ -1,0 +1,57 @@
+name: Build Zig (midr_el1 fix)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Zig version to build (must exist on ziglang.org/download)
+        required: true
+        default: "0.16.0"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xz-utils cmake python3
+
+      - name: Download and extract zig-bootstrap tarball
+        run: |
+          curl -fL --retry 3 -o zig-bootstrap.tar.xz \
+            "https://ziglang.org/download/${{ inputs.version }}/zig-bootstrap-${{ inputs.version }}.tar.xz"
+          tar -xJf zig-bootstrap.tar.xz
+          mv zig-bootstrap-* zig-bootstrap
+          rm zig-bootstrap.tar.xz
+
+      - name: Apply midr_el1 fix
+        run: |
+          cd zig-bootstrap
+          patch -p1 < ../patches/0001-aarch64-detect-cpu-from-proc-cpuinfo.patch
+
+      - name: Build zig
+        run: |
+          cd zig-bootstrap
+          # Run both cmake installs in parallel; build.sh omits -j.
+          sed -i 's|cmake --build . --target install$|cmake --build . --target install -j$(nproc)|' build
+          ./build aarch64-linux-gnu baseline
+
+      - name: Smoke test
+        run: |
+          cd zig-bootstrap
+          ./out/zig-aarch64-linux-gnu-baseline/bin/zig version
+          ./out/zig-aarch64-linux-gnu-baseline/bin/zig env
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zig-${{ inputs.version }}-aarch64-linux-fixed
+          path: zig-bootstrap/out/zig-aarch64-linux-gnu-baseline/
+          if-no-files-found: error
