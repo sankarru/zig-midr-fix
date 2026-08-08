@@ -46,8 +46,10 @@ jobs:
       - name: Smoke test
         run: |
           cd zig-bootstrap
-          ./out/zig-aarch64-linux-gnu-baseline/bin/zig version
-          ./out/zig-aarch64-linux-gnu-baseline/bin/zig env
+          ls -la out/zig-aarch64-linux-gnu-baseline/
+          # -Dflat installs the compiler at the prefix root, not bin/zig.
+          ./out/zig-aarch64-linux-gnu-baseline/zig version
+          ./out/zig-aarch64-linux-gnu-baseline/zig env
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
