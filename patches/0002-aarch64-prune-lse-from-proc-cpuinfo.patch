@@ -1,0 +1,362 @@
+From 99baaefe316fbfc388d6111bfbc3178217b7960b Mon Sep 17 00:00:00 2001
+From: ru <ru@local>
+Date: Sun, 9 Aug 2026 06:23:37 +0000
+Subject: [PATCH] aarch64: prune unconfirmed CPU features from /proc/cpuinfo
+
+The model matched from CPU implementer/part can advertise ISA extensions
+that the running kernel does not actually expose at EL0. The most
+consequential example is LSE atomics: a v8.1/v8.2 core (e.g. cortex_a55)
+implies lse, so the compiler emits casa/ldaddal which SIGILL on kernels
+that never enabled LSE.
+
+Validate the model against the "Features" line of /proc/cpuinfo:
+- if the model implies an ARMv8.1+ baseline (and therefore LSE) but the
+  kernel does not list "atomics", fall back to the generic model, whose
+  baseline does not imply LSE, and graft the confirmed features onto it;
+- otherwise prune every ISA feature the kernel does not confirm.
+
+The generic model must not imply any ARMv8.1+ marker, and the grafted
+features (aes, sha2, crc, fp_armv8, neon, ete) only pull in v8.0-level
+dependencies, so the resulting target never emits LSE instructions.
+---
+ zig/lib/std/zig/system/linux.zig | 202 +++++++++++++++++++++++++------
+ 1 file changed, 163 insertions(+), 39 deletions(-)
+
+diff --git a/zig/lib/std/zig/system/linux.zig b/zig/lib/std/zig/system/linux.zig
+index 473b8b9..60c4b17 100644
+--- a/zig/lib/std/zig/system/linux.zig
++++ b/zig/lib/std/zig/system/linux.zig
+@@ -58,7 +58,7 @@ const SparcCpuinfoImpl = struct {
+ const SparcCpuinfoParser = CpuinfoParser(SparcCpuinfoImpl);
+ 
+ test "cpuinfo: SPARC" {
+-    try testParser(SparcCpuinfoParser, .sparc64, &Target.sparc.cpu.niagara2,
++    try testParser(SparcCpuinfoParser, .sparc64, &Target.sparc.cpu.niagara2, Target.sparc.cpu.niagara2.features,
+         \\cpu             : UltraSparc T2 (Niagara2)
+         \\fpu             : UltraSparc T2 integrated FPU
+         \\pmu             : niagara2
+@@ -105,7 +105,7 @@ const RiscvCpuinfoImpl = struct {
+ const RiscvCpuinfoParser = CpuinfoParser(RiscvCpuinfoImpl);
+ 
+ test "cpuinfo: RISC-V" {
+-    try testParser(RiscvCpuinfoParser, .riscv64, &Target.riscv.cpu.sifive_u74,
++    try testParser(RiscvCpuinfoParser, .riscv64, &Target.riscv.cpu.sifive_u74, Target.riscv.cpu.sifive_u74.features,
+         \\processor : 0
+         \\hart      : 1
+         \\isa       : rv64imafdc
+@@ -174,13 +174,13 @@ const PowerpcCpuinfoImpl = struct {
+ const PowerpcCpuinfoParser = CpuinfoParser(PowerpcCpuinfoImpl);
+ 
+ test "cpuinfo: PowerPC" {
+-    try testParser(PowerpcCpuinfoParser, .powerpc, &Target.powerpc.cpu.@"970",
++    try testParser(PowerpcCpuinfoParser, .powerpc, &Target.powerpc.cpu.@"970", Target.powerpc.cpu.@"970".features,
+         \\processor : 0
+         \\cpu       : PPC970MP, altivec supported
+         \\clock     : 1250.000000MHz
+         \\revision  : 1.1 (pvr 0044 0101)
+     );
+-    try testParser(PowerpcCpuinfoParser, .powerpc64le, &Target.powerpc.cpu.pwr8,
++    try testParser(PowerpcCpuinfoParser, .powerpc64le, &Target.powerpc.cpu.pwr8, Target.powerpc.cpu.pwr8.features,
+         \\processor : 0
+         \\cpu       : POWER8 (raw), altivec supported
+         \\clock     : 2926.000000MHz
+@@ -242,7 +242,7 @@ const S390xCpuinfoImpl = struct {
+ const S390xCpuinfoParser = CpuinfoParser(S390xCpuinfoImpl);
+ 
+ test "cpuinfo: S390x" {
+-    try testParser(S390xCpuinfoParser, .s390x, &Target.s390x.cpu.z15,
++    try testParser(S390xCpuinfoParser, .s390x, &Target.s390x.cpu.z15, Target.s390x.cpu.z15.features,
+         \\physical id     : 5
+         \\core id         : 5
+         \\book id         : 5
+@@ -263,20 +263,25 @@ const ArmCpuinfoImpl = struct {
+     const num_cores = 4;
+ 
+     // Mapping of Linux /proc/cpuinfo "Features" tokens to Zig aarch64 CPU
+-    // features. Only meaningful for 64-bit (aarch64) targets; on big.LITTLE
+-    // systems the CPU model matched from the first core may advertise ISA
+-    // extensions (e.g. LSE atomics) that not all cores implement, and reading
+-    // the ID_AA64* system registers from EL0 requires kernel >= 4.11. The
+-    // "Features" line in /proc/cpuinfo is the kernel's authoritative, safe
+-    // set of extensions available at EL0, so we intersect the matched model's
+-    // feature set with it to avoid emitting instructions that SIGILL.
++    // features. Only meaningful for 64-bit (aarch64) targets. The "Features"
++    // line in /proc/cpuinfo is the kernel's authoritative set of extensions
++    // available at EL0, so we use it to validate the ISA claims of the CPU
++    // model matched from "CPU implementer"/"CPU part" (the model table can
++    // advertise extensions - e.g. LSE atomics on a v8.1/v8.2 core - that the
++    // running kernel does not actually expose, and emitting those instructions
++    // would SIGILL).
++    //
++    // Tokens without a corresponding Zig aarch64 feature are mapped onto the
++    // feature that LLVM enables together with them (pmull -> aes, sha1 ->
++    // sha2); others (fcma, dcpop, sm3, sha512, ...) have no Zig feature and
++    // are simply not listed.
+     const aarch64_feature_map = .{
+-        .{ "fp", "fp" },
++        .{ "fp", "fp_armv8" },
+         .{ "asimd", "neon" },
+         .{ "evtstrm", "ete" },
+         .{ "aes", "aes" },
+-        .{ "pmull", "pmull" },
+-        .{ "sha1", "sha1" },
++        .{ "pmull", "aes" },
++        .{ "sha1", "sha2" },
+         .{ "sha2", "sha2" },
+         .{ "crc32", "crc" },
+         .{ "atomics", "lse" },
+@@ -284,28 +289,24 @@ const ArmCpuinfoImpl = struct {
+         .{ "asimdhp", "fullfp16" },
+         .{ "asimdrdm", "rdm" },
+         .{ "jscvt", "jsconv" },
+-        .{ "fcma", "fcma" },
+-        .{ "lrcpc", "lrcpc" },
+-        .{ "dcpop", "dcpop" },
++        .{ "lrcpc", "rcpc" },
++        .{ "ilrcpc", "rcpc_immo" },
+         .{ "sha3", "sha3" },
+-        .{ "sm3", "sm3" },
+         .{ "sm4", "sm4" },
+         .{ "asimddp", "dotprod" },
+-        .{ "sha512", "sha512" },
+         .{ "sve", "sve" },
+         .{ "asimdfhm", "fp16fml" },
+         .{ "dit", "dit" },
+-        .{ "ilrcpc", "ilrcpc" },
+         .{ "flagm", "flagm" },
+         .{ "ssbs", "ssbs" },
+         .{ "sb", "sb" },
+         .{ "paca", "pauth" },
+         .{ "pacg", "pauth" },
+         .{ "sve2", "sve2" },
+-        .{ "sveaes", "sve2_aes" },
+-        .{ "svebitperm", "sve2_bitperm" },
+-        .{ "svesha3", "sve2_sha3" },
+-        .{ "svesm4", "sve2_sm4" },
++        .{ "sveaes", "sve_aes" },
++        .{ "svebitperm", "sve_bitperm" },
++        .{ "svesha3", "sve_sha3" },
++        .{ "svesm4", "sve_sm4" },
+         .{ "i8mm", "i8mm" },
+         .{ "bf16", "bf16" },
+         .{ "rng", "rand" },
+@@ -314,6 +315,49 @@ const ArmCpuinfoImpl = struct {
+         .{ "ecv", "ecv" },
+         .{ "sme", "sme" },
+         .{ "sme2", "sme2" },
++        .{ "lse2", "lse2" },
++        .{ "lse128", "lse128" },
++        .{ "mops", "mops" },
++        .{ "cpa", "cpa" },
++        .{ "cssc", "cssc" },
++        .{ "hbc", "hbc" },
++        .{ "gcs", "gcs" },
++        .{ "ite", "ite" },
++        .{ "ls64", "ls64" },
++        .{ "lsfe", "lsfe" },
++        .{ "lsui", "lsui" },
++        .{ "crypto", "crypto" },
++        .{ "ccdp", "ccdp" },
++        .{ "d128", "d128" },
++        .{ "faminmax", "faminmax" },
++        .{ "fp8", "fp8" },
++        .{ "fp8fma", "fp8fma" },
++        .{ "fp8dot2", "fp8dot2" },
++        .{ "fp8dot4", "fp8dot4" },
++        .{ "lut", "lut" },
++        .{ "mec", "mec" },
++        .{ "rcpc3", "rcpc3" },
++        .{ "sme2p1", "sme2p1" },
++        .{ "sve2p1", "sve2p1" },
++        .{ "wfxt", "wfxt" },
++        .{ "tme", "tme" },
++        .{ "xs", "xs" },
++        .{ "sme_f16f16", "sme_f16f16" },
++        .{ "sme_f64f64", "sme_f64f64" },
++        .{ "sme_f8f16", "sme_f8f16" },
++        .{ "sme_f8f32", "sme_f8f32" },
++        .{ "sme_b16b16", "sme_b16b16" },
++        .{ "sme_i16i64", "sme_i16i64" },
++        .{ "sve_f16f32mm", "sve_f16f32mm" },
++        .{ "sve_aes2", "sve_aes2" },
++        .{ "sve_b16b16", "sve_b16b16" },
++        .{ "sve_bfscale", "sve_bfscale" },
++        .{ "ssve_aes", "ssve_aes" },
++        .{ "ssve_bitperm", "ssve_bitperm" },
++        .{ "ssve_fexpa", "ssve_fexpa" },
++        .{ "ssve_fp8dot2", "ssve_fp8dot2" },
++        .{ "ssve_fp8dot4", "ssve_fp8dot4" },
++        .{ "ssve_fp8fma", "ssve_fp8fma" },
+     };
+     const aarch64_feature_count = aarch64_feature_map.len;
+ 
+@@ -417,14 +461,13 @@ const ArmCpuinfoImpl = struct {
+ 
+         // XXX We pick the first core on big.LITTLE systems, hopefully the
+         // LITTLE one.
+-        const model = known_models[0] orelse return null;
++        var model = known_models[0] orelse return null;
+         var features = model.features;
+ 
+         if (is_64bit) {
+-            // Intersect the model's features with the features reported by
+-            // /proc/cpuinfo across all cores. If every core section carries a
+-            // "Features" line, prune any mapped ISA feature that is not
+-            // reported (e.g. lse on kernels that do not list "atomics").
++            // Intersect the "Features" lines reported by the kernel across all
++            // cores. If every core section carries one, validate the model's
++            // ISA claims against it.
+             var common: u128 = std.math.maxInt(u128);
+             for (self.cores[0..self.core_no]) |core| {
+                 if (!core.have_features) return Target.Cpu{
+@@ -434,10 +477,53 @@ const ArmCpuinfoImpl = struct {
+                 };
+                 common &= core.features;
+             }
+-            inline for (aarch64_feature_map, 0..) |pair, i| {
+-                const bit = @as(u128, 1) << @intCast(i);
+-                if ((common & bit) == 0)
+-                    features.removeFeature(@intFromEnum(@field(Target.aarch64.Feature, pair[1])));
++
++            // The matched model may assume ARMv8.1 (e.g. cortex_a55 is a
++            // v8.2 core and therefore implies LSE atomics), but emulated or
++            // restricted kernels may not expose LSE at all. Compiling with
++            // LSE would SIGILL, so fall back to the generic model, whose
++            // baseline does not imply LSE. The arch-level markers are checked
++            // explicitly because model.features does not include the features
++            // pulled in transitively via dependencies (v8_1a implies lse).
++            const lse_implied = blk: {
++                inline for (.{
++                    "v8_1a", "v8_2a", "v8_3a", "v8_4a", "v8_5a", "v8_6a",
++                    "v8_7a", "v8_8a", "v8_9a", "v8r",
++                    "v9a",   "v9_1a", "v9_2a", "v9_3a", "v9_4a", "v9_5a", "v9_6a",
++                }) |name| {
++                    if (features.isEnabled(@intFromEnum(@field(Target.aarch64.Feature, name))))
++                        break :blk true;
++                }
++                break :blk false;
++            };
++            if (lse_implied) {
++                const atomics_bit = blk: {
++                    inline for (aarch64_feature_map, 0..) |pair, i| {
++                        if (mem.eql(u8, pair[0], "atomics"))
++                            break :blk @as(u128, 1) << @intCast(i);
++                    }
++                    break :blk 0;
++                };
++                if ((common & atomics_bit) == 0) {
++                    model = &Target.aarch64.cpu.generic;
++                    features = model.features;
++                    // The generic model has no ISA features of its own, so
++                    // re-add the ones the kernel confirmed for this CPU.
++                    inline for (aarch64_feature_map, 0..) |pair, i| {
++                        const bit = @as(u128, 1) << @intCast(i);
++                        if ((common & bit) != 0)
++                            features.addFeature(@intFromEnum(@field(Target.aarch64.Feature, pair[1])));
++                    }
++                } else {
++                    // Prune any ISA feature that the kernel does not confirm,
++                    // so we never emit instructions that are not available at
++                    // EL0.
++                    inline for (aarch64_feature_map, 0..) |pair, i| {
++                        const bit = @as(u128, 1) << @intCast(i);
++                        if ((common & bit) == 0)
++                            features.removeFeature(@intFromEnum(@field(Target.aarch64.Feature, pair[1])));
++                    }
++                }
+             }
+         }
+ 
+@@ -452,7 +538,7 @@ const ArmCpuinfoImpl = struct {
+ const ArmCpuinfoParser = CpuinfoParser(ArmCpuinfoImpl);
+ 
+ test "cpuinfo: ARM" {
+-    try testParser(ArmCpuinfoParser, .arm, &Target.arm.cpu.arm1176jz_s,
++    try testParser(ArmCpuinfoParser, .arm, &Target.arm.cpu.arm1176jz_s, Target.arm.cpu.arm1176jz_s.features,
+         \\processor       : 0
+         \\model name      : ARMv6-compatible processor rev 7 (v6l)
+         \\BogoMIPS        : 997.08
+@@ -463,7 +549,7 @@ test "cpuinfo: ARM" {
+         \\CPU part        : 0xb76
+         \\CPU revision    : 7
+     );
+-    try testParser(ArmCpuinfoParser, .arm, &Target.arm.cpu.cortex_a7,
++    try testParser(ArmCpuinfoParser, .arm, &Target.arm.cpu.cortex_a7, Target.arm.cpu.cortex_a7.features,
+         \\processor : 0
+         \\model name : ARMv7 Processor rev 3 (v7l)
+         \\BogoMIPS : 18.00
+@@ -484,30 +570,68 @@ test "cpuinfo: ARM" {
+         \\CPU part : 0xc0f
+         \\CPU revision : 3
+     );
+-    try testParser(ArmCpuinfoParser, .aarch64, &Target.aarch64.cpu.cortex_a72,
++    try testParser(ArmCpuinfoParser, .aarch64, &Target.aarch64.cpu.cortex_a72, Target.aarch64.cpu.cortex_a72.features,
+         \\processor       : 0
+         \\BogoMIPS        : 108.00
+-        \\Features        : fp asimd evtstrm crc32 cpuid
++        \\Features        : fp asimd evtstrm aes pmull sha1 sha2 crc32 cpuid
+         \\CPU implementer : 0x41
+         \\CPU architecture: 8
+         \\CPU variant     : 0x0
+         \\CPU part        : 0xd08
+         \\CPU revision    : 3
+     );
++    // cortex_a55 is a v8.2 core and its model features therefore imply LSE.
++    // When the kernel does not list "atomics", we must not emit LSE: the
++    // parser must fall back to the generic model, whose baseline has no LSE.
++    // The features confirmed by the kernel (fp_armv8, neon, ete, aes, sha2,
++    // crc) are then grafted onto the generic base.
++    try testParser(ArmCpuinfoParser, .aarch64, &Target.aarch64.cpu.generic,
++        generic_plus_confirmed_features,
++        \\processor       : 0
++        \\BogoMIPS        : 52.00
++        \\Features        : fp asimd evtstrm aes pmull sha1 sha2 crc32
++        \\CPU implementer : 0x41
++        \\CPU architecture: 8
++        \\CPU variant     : 0x0
++        \\CPU part        : 0xd05
++        \\CPU revision    : 1
++    );
++    // ... but keep the cortex_a55 model when the kernel does list "atomics"
++    // (and the rest of its v8.2 ISA is confirmed by the Features line).
++    try testParser(ArmCpuinfoParser, .aarch64, &Target.aarch64.cpu.cortex_a55, Target.aarch64.cpu.cortex_a55.features,
++        \\processor       : 0
++        \\BogoMIPS        : 52.00
++        \\Features        : fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics lrcpc asimdrdm asimddp fphp asimdhp
++        \\CPU implementer : 0x41
++        \\CPU architecture: 8
++        \\CPU variant     : 0x0
++        \\CPU part        : 0xd05
++        \\CPU revision    : 1
++    );
+ }
+ 
+ fn testParser(
+     parser: anytype,
+     arch: Target.Cpu.Arch,
+     expected_model: *const Target.Cpu.Model,
++    expected_features: Target.Cpu.Feature.Set,
+     input: []const u8,
+ ) !void {
+     var r: Io.Reader = .fixed(input);
+     const result = try parser.parse(arch, &r);
+     try testing.expectEqual(expected_model, result.?.model);
+-    try testing.expect(expected_model.features.eql(result.?.features));
++    try testing.expect(expected_features.eql(result.?.features));
+ }
+ 
++const generic_plus_confirmed_features = blk: {
++    var set = Target.aarch64.cpu.generic.features;
++    set.addFeature(@intFromEnum(Target.aarch64.Feature.fp_armv8));
++    set.addFeature(@intFromEnum(Target.aarch64.Feature.aes));
++    set.addFeature(@intFromEnum(Target.aarch64.Feature.sha2));
++    set.addFeature(@intFromEnum(Target.aarch64.Feature.crc));
++    break :blk set;
++};
++
+ // The generic implementation of a /proc/cpuinfo parser.
+ // For every line it invokes the line_hook method with the key and value strings
+ // as first and second parameters. Returning false from the hook function stops
+-- 
+2.43.0
+
