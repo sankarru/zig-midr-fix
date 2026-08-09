@@ -31,10 +31,13 @@ jobs:
           mv zig-bootstrap-* zig-bootstrap
           rm zig-bootstrap.tar.xz
 
-      - name: Apply midr_el1 fix
+      - name: Apply aarch64 fixes
         run: |
           cd zig-bootstrap
-          patch -p1 < ../patches/0001-aarch64-detect-cpu-from-proc-cpuinfo.patch
+          for patch in ../patches/*.patch; do
+            echo "Applying $patch"
+            patch -p1 < "$patch"
+          done
 
       - name: Build zig
         run: |
