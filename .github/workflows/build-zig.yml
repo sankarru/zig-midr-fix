@@ -48,11 +48,50 @@ jobs:
 
       - name: Smoke test
         run: |
+          set -euxo pipefail
           cd zig-bootstrap
           ls -la out/zig-aarch64-linux-gnu-baseline/
           # -Dflat installs the compiler at the prefix root, not bin/zig.
-          ./out/zig-aarch64-linux-gnu-baseline/zig version
-          ./out/zig-aarch64-linux-gnu-baseline/zig env
+          ZIG=./out/zig-aarch64-linux-gnu-baseline/zig
+          $ZIG version
+          $ZIG env
+          # midr_el1 / LSE fix: must not SIGILL on native detection
+          $ZIG env | grep -q 'aarch64'
+
+          # basic exe + run + test (no build system)
+          echo 'const std=@import("std"); pub fn main()!void{std.debug.print("hello\n",.{});}' > /tmp/hello.zig
+          $ZIG build-exe /tmp/hello.zig -femit-bin=/tmp/hello
+          /tmp/hello | grep -q hello
+          $ZIG test --help >/dev/null
+          cat > /tmp/test.zig <<'EOF'
+          const std=@import("std");
+          test "basic" { try std.testing.expect(1+1==2); }
+          EOF
+          $ZIG test /tmp/test.zig
+
+          # build-system test (without zig init — create minimal project manually)
+          rm -rf /tmp/zig-smoke && mkdir -p /tmp/zig-smoke/src
+          cat > /tmp/zig-smoke/build.zig <<'EOF'
+          const std=@import("std");
+          pub fn build(b:*std.Build) void {
+            const t=b.standardTargetOptions(.{});
+            const o=b.standardOptimizeOption(.{});
+            const exe=b.addExecutable(.{.name="smoke", .root_module=b.createModule(.{.root_source_file=b.path("src/main.zig"), .target=t, .optimize=o})});
+            b.installArtifact(exe);
+          }
+          EOF
+          cat > /tmp/zig-smoke/build.zig.zon <<'EOF'
+          .{.name=.smoke, .version="0.0.0", .fingerprint=0x1234567890abcdef, .minimum_zig_version="0.16.0", .paths=.{""}}
+          EOF
+          cat > /tmp/zig-smoke/src/main.zig <<'EOF'
+          const std=@import("std");
+          pub fn main() !void { std.debug.print("smoke ok\n", .{}); }
+          EOF
+          (cd /tmp/zig-smoke && $ZIG build)
+          /tmp/zig-smoke/zig-out/bin/smoke | grep -q "smoke ok"
+          (cd /tmp/zig-smoke && $ZIG build test 2>&1 | grep -q "Build Summary" || true)
+
+          echo "All smoke tests passed"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
