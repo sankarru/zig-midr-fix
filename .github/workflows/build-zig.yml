@@ -102,7 +102,7 @@ jobs:
           }
           EOF
           cat > /tmp/zig-smoke/build.zig.zon <<'EOF'
-          .{.name=.smoke, .version="0.0.0", .fingerprint=0x1234567890abcdef, .minimum_zig_version="0.16.0", .paths=.{""}}
+          .{.name=.smoke, .version="0.0.0", .fingerprint=0x4946e97a1732031e, .minimum_zig_version="0.16.0", .paths=.{""}}
           EOF
           cat > /tmp/zig-smoke/src/main.zig <<'EOF'
           const std=@import("std");
