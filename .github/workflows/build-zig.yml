@@ -40,6 +40,7 @@ jobs:
           done
 
       - name: Restore zig build cache
+        id: restore
         uses: actions/cache/restore@v4
         with:
           path: zig-bootstrap/out
@@ -48,6 +49,9 @@ jobs:
             zig-${{ inputs.version }}-aarch64-linux-gnu-baseline-
 
       - name: Build zig
+        id: build
+        # If Restore zig build cache provided the final compiler, skip the ~3h build.
+        if: steps.restore.outputs.cache-hit != 'true'
         run: |
           cd zig-bootstrap
           # Run both cmake installs in parallel; build.sh omits -j.
@@ -55,6 +59,7 @@ jobs:
           ./build aarch64-linux-gnu baseline
 
       - name: Save zig build cache
+        if: steps.build.conclusion == 'success' && steps.restore.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: zig-bootstrap/out
