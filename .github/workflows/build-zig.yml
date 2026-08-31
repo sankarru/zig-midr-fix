@@ -39,12 +39,26 @@ jobs:
             patch -p1 < "$patch"
           done
 
+      - name: Restore zig build cache
+        uses: actions/cache/restore@v4
+        with:
+          path: zig-bootstrap/out
+          key: zig-${{ inputs.version }}-aarch64-linux-gnu-baseline-${{ hashFiles('patches/*.patch') }}
+          restore-keys: |
+            zig-${{ inputs.version }}-aarch64-linux-gnu-baseline-
+
       - name: Build zig
         run: |
           cd zig-bootstrap
           # Run both cmake installs in parallel; build.sh omits -j.
           sed -i 's|cmake --build . --target install$|cmake --build . --target install -j$(nproc)|' build
           ./build aarch64-linux-gnu baseline
+
+      - name: Save zig build cache
+        uses: actions/cache/save@v4
+        with:
+          path: zig-bootstrap/out
+          key: zig-${{ inputs.version }}-aarch64-linux-gnu-baseline-${{ hashFiles('patches/*.patch') }}
 
       - name: Smoke test
         run: |
@@ -61,7 +75,8 @@ jobs:
           # basic exe + run + test (no build system)
           echo 'const std=@import("std"); pub fn main()!void{std.debug.print("hello\n",.{});}' > /tmp/hello.zig
           $ZIG build-exe /tmp/hello.zig -femit-bin=/tmp/hello
-          /tmp/hello | grep -q hello
+          # std.debug.print writes to stderr; pipe 2>&1 so grep sees it.
+          /tmp/hello 2>&1 | grep -q hello
           $ZIG test --help >/dev/null
           cat > /tmp/test.zig <<'EOF'
           const std=@import("std");
@@ -88,7 +103,7 @@ jobs:
           pub fn main() !void { std.debug.print("smoke ok\n", .{}); }
           EOF
           (cd /tmp/zig-smoke && $ZIG build)
-          /tmp/zig-smoke/zig-out/bin/smoke | grep -q "smoke ok"
+          /tmp/zig-smoke/zig-out/bin/smoke 2>&1 | grep -q "smoke ok"
           (cd /tmp/zig-smoke && $ZIG build test 2>&1 | grep -q "Build Summary" || true)
 
           echo "All smoke tests passed"
