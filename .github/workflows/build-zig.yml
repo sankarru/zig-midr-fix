@@ -66,7 +66,8 @@ jobs:
           cd zig-bootstrap
           ls -la out/zig-aarch64-linux-gnu-baseline/
           # -Dflat installs the compiler at the prefix root, not bin/zig.
-          ZIG=./out/zig-aarch64-linux-gnu-baseline/zig
+          # Use an absolute path so it survives the `cd /tmp/zig-smoke` below.
+          ZIG="$(pwd)/out/zig-aarch64-linux-gnu-baseline/zig"
           $ZIG version
           $ZIG env
           # midr_el1 / LSE fix: must not SIGILL on native detection
